@@ -1,152 +1,109 @@
-# NIM-to-OpenAI Proxy
+# OpenAI → NVIDIA NIM Proxy (pre-wired to free models)
 
-An OpenAI-compatible API server that forwards requests to **NVIDIA NIM** —
-either the NVIDIA cloud API (`integrate.api.nvidia.com`) or a self-hosted NIM
-container — so any tool or SDK that speaks the OpenAI API can point at NIM
-without modification.
+A drop-in proxy that lets you point any OpenAI SDK / client at NVIDIA NIM
+(hosted at `build.nvidia.com` or a self-hosted NIM container). It exposes
+`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, and `/v1/models`,
+translates OpenAI model names to NIM model names, forwards the request, and
+relays streaming (SSE) responses through unmodified.
 
-## Features
+It ships pre-configured with a curated set of NVIDIA NIM's currently **free**
+models (no per-token charge, rate-limited), so `gpt-4o`, `gpt-4o-mini`, etc.
+resolve to a real free NIM model with zero config beyond an API key.
 
-- **OpenAI-compatible routes**: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`
-- **Mixed backends**: route different model aliases to NVIDIA's cloud API *and* self-hosted NIM containers side by side
-- **Model name mapping**: expose friendly aliases (`llama3-70b`) that map to real NIM model IDs (`meta/llama3-70b-instruct`)
-- **Streaming (SSE) passthrough**: `stream: true` requests are proxied byte-for-byte to the client
-- **Retries with backoff**: transient network errors, `429`, and `5xx` responses are retried with exponential backoff + jitter before any bytes reach the client
-- **Multi-key / multi-user auth**: issue your own proxy API keys, each with an optional allow-list of models
-- **Structured logging**: request/response logging via pino, including latency and token usage where available
+## Why
 
-## Quick start
+- Keep your real NVIDIA API key server-side; issue your own proxy key to clients.
+- Let existing code written against `openai` Python/JS SDKs work against NIM
+  without changes — just swap `base_url`.
+- One place to add logging, retries, and model-name aliasing.
+- Works out of the box against free models, no need to look up model IDs first.
+
+## Setup
 
 ```bash
-npm install
+pip install -r requirements.txt
 cp .env.example .env
-# edit .env: set NVIDIA_API_KEY (and NIM_KEY_LOCAL if a self-hosted container needs one)
-npm start
+# edit .env: set NIM_API_KEY (get one free, no credit card, at
+# https://build.nvidia.com/settings/api-keys). MODEL_MAP_JSON can stay blank —
+# it'll use the built-in free-model defaults.
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-The server listens on `PORT` (default `3000`).
+## Free models included by default
 
-## Configuration
+Checked against `build.nvidia.com/models` (filtered to "Free Endpoint") on
+2026-07-03. NVIDIA adds/renames/deprecates free models over time, so verify
+against the live catalog — or hit `GET /free-models` on this proxy, which
+serves this same list — before depending on any of these long-term.
 
-Three JSON files in `config/` control routing; `.env` controls secrets and
-runtime behavior.
+| OpenAI alias | Resolves to (NIM model ID) | Notes |
+|---|---|---|
+| `gpt-4o` | `z-ai/glm-5.2` | Flagship, agentic/coding/reasoning |
+| `gpt-4o-mini` | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` | Omni-modal (text/image/video/speech) |
+| `gpt-4-turbo` / `gpt-4.1` | `deepseek-ai/deepseek-v4-pro` | 1M-token context, strong at coding |
+| `gpt-4.1-mini` | `mistralai/mistral-medium-3.5-128b` | General-purpose, coding, agentic |
+| `gpt-3.5-turbo` | `stepfun-ai/step-3.7-flash` | Fast sparse-MoE reasoning |
+| `o1` | `nvidia/nemotron-3-ultra-550b-a55b` | 1M context, planning/tool-calling |
+| `o1-mini` | `moonshotai/kimi-k2.6` | 1T-param MoE, long-horizon agentic |
 
-### `config/backends.json` — named upstreams
+You can also send a native NIM model ID directly (e.g.
+`minimaxai/minimax-m3`) — unmapped names pass straight through by default.
+The full curated set lives in `FREE_NIM_MODELS` in `config.py`.
 
-```json
-{
-  "cloud": {
-    "baseUrl": "https://integrate.api.nvidia.com/v1",
-    "apiKeyEnv": "NVIDIA_API_KEY"
-  },
-  "local-llama": {
-    "baseUrl": "http://localhost:8000/v1",
-    "apiKeyEnv": "NIM_KEY_LOCAL"
-  }
-}
-```
+Free-tier NIM access is still gated by an API key and a shared rate limit
+(roughly ~40 requests/min per account as of this writing) — "free" means no
+per-token charge, not unauthenticated or unlimited.
 
-Add one entry per backend. `apiKeyEnv` names an environment variable holding
-the key for that backend — leave it unset (empty string) for self-hosted NIM
-containers that don't require auth, which is the common case.
+## Usage
 
-### `config/models.json` — model aliases
-
-```json
-{
-  "llama3-70b": { "backend": "cloud", "target": "meta/llama3-70b-instruct" },
-  "llama3-8b-local": { "backend": "local-llama", "target": "meta/llama3-8b-instruct" }
-}
-```
-
-Clients request `model: "llama3-70b"`; the proxy rewrites it to
-`meta/llama3-70b-instruct` and routes to whichever backend you assigned. The
-response's `model` field is rewritten back to the alias the client used, so
-client-side logic never sees your internal routing.
-
-**Unmapped models**: if a client requests a model not listed here, the proxy
-falls back to `DEFAULT_BACKEND` / `DEFAULT_BASE_URL` from `.env` and passes
-the model name through unchanged — handy for self-hosted setups where you
-don't want to register every model up front.
-
-### `config/clients.json` — proxy-facing API keys
-
-```json
-[
-  { "apiKey": "sk-proxy-demo-000000000000000000000000", "name": "demo-user", "allowedModels": ["*"] },
-  { "apiKey": "sk-proxy-limited-11111111111111111111111", "name": "limited-user", "allowedModels": ["llama3-8b-local"] }
-]
-```
-
-These are the keys *your* clients use against the proxy (`Authorization:
-Bearer sk-proxy-...`) — separate from the upstream NIM keys in `.env`.
-`allowedModels: ["*"]` permits any registered alias; otherwise list specific
-aliases. Generate real keys with something like:
-
-```bash
-node -e "console.log('sk-proxy-' + require('crypto').randomBytes(24).toString('hex'))"
-```
-
-### `.env` — secrets and runtime tuning
-
-See `.env.example` for the full list: server port, log level/format, default
-fallback backend, retry attempts/backoff, and upstream timeout.
-
-## Usage examples
-
-Point any OpenAI SDK at the proxy's base URL and use one of your proxy keys:
-
-```bash
-curl http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer sk-proxy-demo-000000000000000000000000" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "llama3-70b",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-Streaming:
-
-```bash
-curl -N http://localhost:3000/v1/chat/completions \
-  -H "Authorization: Bearer sk-proxy-demo-000000000000000000000000" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "llama3-70b",
-    "messages": [{"role": "user", "content": "Count to 5"}],
-    "stream": true
-  }'
-```
-
-Python (`openai` SDK):
+Point any OpenAI client at the proxy:
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:3000/v1",
-    api_key="sk-proxy-demo-000000000000000000000000",
+    base_url="http://localhost:8000/v1",
+    api_key="whatever-you-set-as-PROXY_API_KEY-or-anything-if-unset",
 )
 
 resp = client.chat.completions.create(
-    model="llama3-8b-local",
+    model="gpt-4o",  # translated to a free NIM model, e.g. z-ai/glm-5.2
     messages=[{"role": "user", "content": "Hello!"}],
+    stream=True,
 )
-print(resp.choices[0].message.content)
+for chunk in resp:
+    print(chunk.choices[0].delta.content or "", end="")
 ```
 
-## How requests flow
+Browse what's available:
 
-1. `authenticate` middleware validates the proxy API key against `config/clients.json`.
-2. `authorizeModel` middleware checks the client's `allowedModels` against the requested model.
-3. `modelRouter.resolveModel` looks up the model alias in `config/models.json`, resolving a backend + real upstream model name (or falls back to the default backend for unmapped models).
-4. `retryFetch` sends the request upstream, retrying on network failure / `429` / `5xx` with exponential backoff — retries only ever happen before any response bytes reach the client.
-5. Non-streaming responses are parsed, logged (including `usage` token counts when the upstream returns them), have their `model` field rewritten back to the client-facing alias, and returned as JSON.
-6. Streaming responses are piped through as raw SSE once the upstream connection is established successfully.
+```bash
+curl http://localhost:8000/free-models   # curated free models this proxy knows about
+curl http://localhost:8000/v1/models     # live catalog proxied straight from NIM
+curl http://localhost:8000/health        # confirms upstream + default model + key presence
+```
 
-## Notes & limitations
+## Configuration (env vars)
 
-- Self-hosted NIM containers already speak the OpenAI schema for most endpoints, so this proxy mostly adds routing, auth, retries, and logging on top — it does not reformat request/response bodies beyond the `model` field.
-- Streaming requests are retried only while establishing the connection; once bytes start flowing, a mid-stream failure ends the client's stream rather than silently retrying (retrying a partially-consumed stream would risk duplicate output).
-- Token-usage logging for streaming responses is best-effort: it depends on whether the upstream NIM model includes a `usage` field in its final SSE chunk (pass `stream_options: {"include_usage": true}` in the request body if the backend supports it).
+| Variable | Description | Default |
+|---|---|---|
+| `NIM_BASE_URL` | Target NIM OpenAI-compatible base URL | `https://integrate.api.nvidia.com/v1` |
+| `NIM_API_KEY` | NVIDIA API key sent upstream | *(none)* |
+| `PROXY_API_KEY` | If set, clients must present this key to the proxy | *(open)* |
+| `MODEL_MAP_JSON` | JSON dict mapping OpenAI model names → NIM model names | `{}` |
+| `PASSTHROUGH_UNMAPPED_MODELS` | Forward unmapped model names as-is instead of erroring | `true` |
+| `DEFAULT_MODEL` | Used when the client omits `model` | `meta/llama-3.1-8b-instruct` |
+| `REQUEST_TIMEOUT_SECONDS` | Upstream request timeout | `120` |
+| `MAX_RETRIES` | Retries on transport-level failure | `2` |
+
+## Notes
+
+- Streaming responses are relayed byte-for-byte from NIM's SSE stream, so no
+  chunk-format translation is needed — NIM already emits OpenAI-shaped SSE chunks.
+- A handful of OpenAI-only request fields (`service_tier`, `parallel_tool_calls`,
+  `store`, `metadata`, `user`) are stripped before forwarding, since NIM/vLLM
+  backends may reject unknown fields. Extend `_UNSUPPORTED_FIELDS` in `main.py`
+  if you hit others.
+- This is a minimal reference implementation — for production, add rate
+  limiting, structured request logging/metrics, and TLS termination (or run
+  behind a reverse proxy that provides it).
