@@ -1,0 +1,12 @@
+[
+  {
+    "apiKey": "sk-proxy-demo-000000000000000000000000",
+    "name": "demo-user",
+    "allowedModels": ["*"]
+  },
+  {
+    "apiKey": "sk-proxy-limited-11111111111111111111111",
+    "name": "limited-user",
+    "allowedModels": ["llama3-8b-local"]
+  }
+]
